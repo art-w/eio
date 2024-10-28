@@ -22,6 +22,8 @@ module Trace = Eio.Private.Trace
 module Rcfd = Eio_unix.Private.Rcfd
 module Poll = Iomux.Poll
 
+type Fiber_context.scheduler_tag += Posix_scheduler
+
 type exit = [`Exit_scheduler]
 
 (* The type of items in the run queue. *)
@@ -377,7 +379,7 @@ let run ~extra_effects t main x =
   in
   let result = ref None in
   let `Exit_scheduler =
-    let new_fiber = Fiber_context.make_root () in
+    let new_fiber = Fiber_context.make_root Posix_scheduler in
     Domain_local_await.using
       ~prepare_for_await:Eio_utils.Dla.prepare_for_await
       ~while_running:(fun () ->

@@ -18,5 +18,6 @@ module Private = struct
       | Suspend = Suspend.Suspend
       | Fork = Fiber.Fork
       | Get_context = Cancel.Get_context
+      | Nest = Fiber.Nest
   end
 end

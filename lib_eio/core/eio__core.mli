@@ -396,6 +396,8 @@ module Fiber : sig
   val without_binding : 'a key -> (unit -> 'b) -> 'b
   (** [with_binding key value fn] runs [fn] with any binding for [key] removed.
       *)
+
+  val nest : (unit -> 'a) -> 'a
 end
 
 (** @canonical Eio.Exn *)
@@ -610,15 +612,19 @@ module Private : sig
 
   (** Every fiber has an associated context. *)
   module Fiber_context : sig
+    type scheduler_tag = ..
+
     type t
 
-    val make_root : unit -> t
+    val make_root : scheduler_tag -> t
     (** Make a new root context for a new domain. *)
 
     val destroy : t -> unit
     (** [destroy t] removes [t] from its cancellation context. *)
 
     val tid : t -> Trace.id
+
+    val scheduler_tag : t -> scheduler_tag
 
     (** {2 Cancellation}
 
@@ -726,6 +732,9 @@ module Private : sig
 
       | Get_context : Fiber_context.t Effect.t
       (** [perform Get_context] immediately returns the current fiber's context (without switching fibers). *)
+
+      | Nest : ((unit -> 'a) -> 'a) Effect.t
+      (** [perform Nest] returns a function to start a nested scheduler. *)
   end
 
   (** Suspend a fiber and enter the scheduler. *)

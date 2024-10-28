@@ -197,3 +197,5 @@ let on_release t fn =
 
 let on_release_cancellable t fn =
   Hook (t.on_release_lock, on_release_full t fn)
+
+let scheduler_tag t = Cancel.scheduler_tag t.cancel

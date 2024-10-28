@@ -5,6 +5,8 @@ type state =
   | Cancelling of exn * Printexc.raw_backtrace
   | Finished
 
+type scheduler_tag = ..
+
 (* There is a tree of cancellation contexts for each domain.
    A fiber is always in exactly one context, but can move to a new child and back (see [sub]).
    While a fiber is performing a cancellable operation, it sets a cancel function.
@@ -20,6 +22,7 @@ type t = {
   fibers : fiber_context Lwt_dllist.t;
   protected : bool;
   domain : Domain.id;         (* Prevent access from other domains *)
+  scheduler_tag : scheduler_tag;
 }
 and fiber_context = {
   tid : Trace.id;
@@ -28,6 +31,8 @@ and fiber_context = {
   mutable cancel_fn : exn -> unit;  (* Encourage the current operation to finish *)
   mutable vars : Hmap.t;
 }
+
+let scheduler_tag t = t.scheduler_tag
 
 type _ Effect.t += Get_context : fiber_context Effect.t
 
@@ -90,12 +95,12 @@ let move_fiber_to t fiber =
   fiber.cancel_node <- Some new_node
 
 (* Note: the new value is not linked into the cancellation tree. *)
-let create ~protected purpose =
+let create ~protected ~scheduler_tag purpose =
   let children = Lwt_dllist.create () in
   let fibers = Lwt_dllist.create () in
   let id = Trace.mint_id () in
   Trace.create_cc id purpose;
-  { id; state = Finished; children; protected; fibers; domain = Domain.self () }
+  { id; state = Finished; children; protected; fibers; domain = Domain.self (); scheduler_tag }
 
 (* Links [t] into the tree as a child of [parent] and returns a function to remove it again. *)
 let activate t ~parent =
@@ -111,7 +116,8 @@ let activate t ~parent =
 (* Runs [fn] with a fresh cancellation context. *)
 let with_cc ~ctx:fiber ~parent ~protected purpose fn =
   if not protected then check parent;
-  let t = create ~protected purpose in
+  let scheduler_tag = scheduler_tag fiber.cancel_context in
+  let t = create ~protected ~scheduler_tag purpose in
   let deactivate = activate t ~parent in
   move_fiber_to t fiber;
   let cleanup () = move_fiber_to parent fiber; deactivate () in
@@ -192,9 +198,11 @@ let sub_unchecked purpose fn =
 
 module Fiber_context = struct
   type t = fiber_context
+  type nonrec scheduler_tag = scheduler_tag = ..
 
   let tid t = t.tid
   let cancellation_context t = t.cancel_context
+  let scheduler_tag t = t.cancel_context.scheduler_tag
 
   let get_error t = get_error t.cancel_context
 
@@ -211,8 +219,8 @@ module Fiber_context = struct
     t.cancel_node <- Some (Lwt_dllist.add_r t cc.fibers);
     t
 
-  let make_root () =
-    let cc = create ~protected:false Root in
+  let make_root scheduler_tag =
+    let cc = create ~protected:false ~scheduler_tag Root in
     cc.state <- On;
     make ~cc ~vars:Hmap.empty
 

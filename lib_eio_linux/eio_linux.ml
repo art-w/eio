@@ -493,10 +493,9 @@ let stdenv ~run_event_loop =
     method backend_id = "linux"
   end
 
-let run_event_loop (type a) ?fallback config (main : _ -> a) arg : a =
-  Sched.with_sched ?fallback config @@ fun st ->
+let extra_effects : _ Effect.Deep.effect_handler =
   let open Effect.Deep in
-  let extra_effects : _ effect_handler = {
+  {
     effc = fun (type a) (e : a Effect.t) : ((a, Sched.exit) continuation -> Sched.exit) option ->
       match e with
       | Eio_unix.Private.Get_monotonic_clock -> Some (fun k -> continue k mono_clock)
@@ -546,7 +545,10 @@ let run_event_loop (type a) ?fallback config (main : _ -> a) arg : a =
             discontinue k (Err.wrap code name arg)
         )
       | _ -> None
-  } in
+  }
+
+let run_event_loop (type a) ?fallback config (main : _ -> a) arg : a =
+  Sched.with_sched ?fallback config @@ fun st ->
   Sched.run ~extra_effects st main arg
 
 let run ?queue_depth ?n_blocks ?block_size ?polling_timeout ?fallback main =

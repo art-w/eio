@@ -43,6 +43,8 @@ type io_job =
 
 type runnable =
   | IO : runnable
+  | IO_yield : (unit -> bool) -> runnable
+  | Thread_fn : ('a -> [`Exit_scheduler]) * 'a -> runnable
   | Thread : 'a Suspended.t * 'a -> runnable
   | Failed_thread : 'a Suspended.t * exn -> runnable
 
@@ -69,7 +71,16 @@ type t = {
   sleep_q: Zzz.t;
   
   thread_pool : Eio_unix.Private.Thread_pool.t;
+
+  scheduler_tag : Fiber_context.scheduler_tag;
 }
+
+type Fiber_context.scheduler_tag += Linux_scheduler of t
+
+let t_of_suspended (k : _ Suspended.t) =
+  match Fiber_context.scheduler_tag k.fiber with
+  | Linux_scheduler t -> t
+  | _ -> invalid_arg "expected linux scheduler tag!"
 
 type _ Effect.t +=
   | Enter : (t -> 'a Suspended.t -> unit) -> 'a Effect.t
@@ -173,8 +184,8 @@ let submit_pending_io st =
     Trace.log "submit_pending_io";
     fn st
 
-let rec submit_rw_req st ({op; file_offset; fd; buf; len; cur_off; action} as req) =
-  let {uring;io_q;_} = st in
+let rec submit_rw_req _st ({op; file_offset; fd; buf; len; cur_off; action} as req) =
+  let {uring;io_q;_} as st = t_of_suspended action in
   let off = Uring.Region.to_offset buf + cur_off in
   let len = match len with Exactly l | Upto l -> l in
   let len = len - cur_off in
@@ -213,6 +224,17 @@ let rec schedule ({run_q; sleep_q; mem_q; uring; _} as st) : [`Exit_scheduler] =
   | Some Failed_thread (k, ex) ->
     Fiber_context.clear_cancel_fn k.fiber;
     Suspended.discontinue k ex
+  | Some Thread_fn (fn, v) ->
+    fn v
+  | Some (IO_yield finished as io_yield) ->
+      if Lf_queue.is_empty run_q && finished ()
+      then `Exit_scheduler
+      else (
+        (* TODO: if run_q is empty, suspend this scheduler until new stuff is pushed *)
+        Fiber.yield ();
+        Lf_queue.push run_q io_yield;
+        schedule st
+      )
   | Some IO -> (* Note: be sure to re-inject the IO task before continuing! *)
     (* This is not a fair scheduler: timers always run before all other IO *)
     let now = Mtime_clock.now () in
@@ -221,7 +243,7 @@ let rec schedule ({run_q; sleep_q; mem_q; uring; _} as st) : [`Exit_scheduler] =
       (* A sleeping task is now due *)
       Lf_queue.push run_q IO;                   (* Re-inject IO job in the run queue *)
       begin match k with
-        | Fiber k -> Suspended.continue k ()
+        | Fiber k -> continue ~st k ()
         | Fn fn -> fn (); schedule st
       end
     | `Wait_until _ | `Nothing as next_due ->
@@ -283,25 +305,50 @@ let rec schedule ({run_q; sleep_q; mem_q; uring; _} as st) : [`Exit_scheduler] =
             schedule st
           )
         )
+
+and continue : type a. st:t -> a Suspended.t -> a -> [`Exit_scheduler]
+= fun ~st k v ->
+  let stk = t_of_suspended k in
+  if st == stk
+  then Suspended.continue k v
+  else (
+    Lf_queue.push stk.run_q (Thread (k, v));
+    schedule st
+  )
+
+and discontinue : type a. st:t -> a Suspended.t -> exn -> [`Exit_scheduler]
+= fun ~st k exn ->
+  let stk = t_of_suspended k in
+  if st == stk
+  then Suspended.discontinue k exn
+  else (
+    Lf_queue.push stk.run_q (Failed_thread (k, exn));
+    schedule st
+  )
+
+and continue_fn ~st ~stk k v =
+  if st == stk
+  then k v
+  else (
+    Lf_queue.push stk.run_q (Thread_fn (k, v));
+    schedule st
+  )
+
 and handle_complete st ~runnable result =
   submit_pending_io st;                       (* If something was waiting for a slot, submit it now. *)
   match runnable with
-  | Read req ->
-    complete_rw_req st req result
-  | Write req ->
-    complete_rw_req st req result
   | Job k ->
     Fiber_context.clear_cancel_fn k.fiber;
-    if result >= 0 then Suspended.continue k result
+    if result >= 0 then continue ~st k result
     else (
       match Fiber_context.get_error k.fiber with
-        | None -> Suspended.continue k result
+        | None -> continue ~st k result
         | Some e ->
           (* If cancelled, report that instead. *)
-          Suspended.discontinue k e
+          discontinue ~st k e
     )
   | Job_no_cancel k ->
-    Suspended.continue k result
+    continue ~st k result
   | Cancel_job ->
     (* We don't care about the result of the cancel operation, and there's nowhere to send it.
        The possibilities are:
@@ -314,30 +361,32 @@ and handle_complete st ~runnable result =
     (* Should we only do this on error, to avoid losing the return value?
        We already do that with rw jobs. *)
     begin match Fiber_context.get_error k.fiber with
-      | None -> f result
-      | Some e -> Suspended.discontinue k e
+      | None -> continue_fn ~st ~stk:(t_of_suspended k) f result
+      | Some e -> discontinue ~st k e
     end
-and complete_rw_req st ({len; cur_off; action; _} as req) res =
+  | Read req
+  | Write req ->
+      let {len; cur_off; action; _} = req in
   Fiber_context.clear_cancel_fn action.fiber;
-  match res, len with
-  | 0, _ -> Suspended.discontinue action End_of_file
+  match result, len with
+  | 0, _ -> discontinue ~st action End_of_file
   | e, _ when e < 0 ->
     begin match Fiber_context.get_error action.fiber with
-      | Some e -> Suspended.discontinue action e        (* If cancelled, report that instead. *)
+      | Some e -> discontinue ~st action e        (* If cancelled, report that instead. *)
       | None ->
         if errno_is_retry e then (
           submit_rw_req st req;
           schedule st
         ) else (
-          Suspended.continue action e
+          continue ~st action e
         )
     end
   | n, Exactly len when n < len - cur_off ->
     req.cur_off <- req.cur_off + n;
     submit_rw_req st req;
     schedule st
-  | _, Exactly len -> Suspended.continue action len
-  | n, Upto _ -> Suspended.continue action n
+  | _, Exactly len -> continue ~st action len
+  | n, Upto _ -> continue ~st action n
 
 let rec enqueue_poll_add fd poll_mask st action =
   Trace.log "poll_add";
@@ -386,8 +435,7 @@ let monitor_event_fd t =
   done;
   assert false
 
-let run ~extra_effects st main arg =
-  let rec fork ~new_fiber:fiber fn =
+let rec fork ~extra_effects ~st ~new_fiber:(fiber : Fiber_context.t) fn =
     let open Effect.Deep in
     Trace.fiber (Fiber_context.tid fiber);
     match_with fn ()
@@ -420,11 +468,16 @@ let run ~extra_effects st main arg =
                 );
               schedule st
             )
-          | Eio.Private.Effects.Fork (new_fiber, f) -> Some (fun k ->
+          | Eio.Private.Effects.Fork (new_fiber, f) ->
+            if Fiber_context.scheduler_tag new_fiber != st.scheduler_tag
+            then None
+            else Some (fun k ->
               let k = { Suspended.k; fiber } in
               enqueue_at_head st k ();
-              fork ~new_fiber f
+              fork ~extra_effects ~st ~new_fiber f
             )
+          | Eio.Private.Effects.Nest ->
+              Some (fun k -> Effect.Deep.continue k (with_nested_sched ~extra_effects ~st))
           | Eio_unix.Private.Await_readable fd -> Some (fun k ->
               match Fiber_context.get_error fiber with
               | Some e -> discontinue k e
@@ -455,14 +508,35 @@ let run ~extra_effects st main arg =
             )
           | e -> extra_effects.effc e
       }
+
+and with_nested_sched : type a. extra_effects:_ -> st:t -> (unit -> a) -> a =
+  fun ~extra_effects ~st:parent fn ->
+  let rec st = { parent with scheduler_tag = Linux_scheduler st; run_q = Lf_queue.create () } in
+  let new_fiber = Fiber_context.make_root st.scheduler_tag in
+  let result = ref None in
+  let finished () = !result <> None in
+  Lf_queue.push st.run_q (IO_yield finished);
+  let `Exit_scheduler =
+    fork ~extra_effects ~st ~new_fiber @@ fun () ->
+    match fn () with
+    | x -> result := Some (Ok x)
+    | exception ex ->
+      let bt = Printexc.get_raw_backtrace () in
+      result := Some (Error (ex, bt))
   in
+  match !result with
+  | None -> assert false
+  | Some (Ok v) -> v
+  | Some (Error (e, bt)) -> Printexc.raise_with_backtrace e bt
+
+let run ~extra_effects (st:t) main arg =
   let result = ref None in
   let `Exit_scheduler =
-    let new_fiber = Fiber_context.make_root () in
+    let new_fiber = Fiber_context.make_root st.scheduler_tag in
     Domain_local_await.using
       ~prepare_for_await:Eio_utils.Dla.prepare_for_await
       ~while_running:(fun () ->
-        fork ~new_fiber (fun () ->
+        fork ~extra_effects ~st ~new_fiber (fun () ->
             Switch.run_protected ~name:"eio_linux" (fun sw ->
                 Fiber.fork_daemon ~sw (fun () -> monitor_event_fd st);
                 match Eio_unix.Private.Thread_pool.run st.thread_pool (fun () -> main arg) with
@@ -542,7 +616,10 @@ let with_sched ?(fallback=no_fallback) config fn =
         let mem_q = Lwt_dllist.create () in
         with_eventfd @@ fun eventfd ->
         let thread_pool = Eio_unix.Private.Thread_pool.create ~sleep_q in
-        fn { mem; uring; run_q; io_q; mem_q; eventfd; need_wakeup = Atomic.make false; sleep_q; thread_pool }
+        let rec st =
+          { mem; uring; run_q; io_q; mem_q; eventfd; need_wakeup = Atomic.make false; sleep_q; thread_pool; scheduler_tag = Linux_scheduler st }
+        in
+        fn st
       with
       | x -> Uring.exit uring; x
       | exception ex ->

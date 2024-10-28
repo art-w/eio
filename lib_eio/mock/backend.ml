@@ -48,6 +48,8 @@ let rec schedule t : exit =
     if Clock.Mono.try_advance t.mono_clock then schedule t
     else `Exit_scheduler      (* Finished (or deadlocked) *)
 
+type Fiber_context.scheduler_tag += Mock_scheduler
+
 (* Run [main] in an Eio main loop. *)
 let run_full main =
   let mono_clock = Clock.Mono.make () in
@@ -101,7 +103,7 @@ let run_full main =
           | _ -> None
       }
   in
-  let new_fiber = Fiber_context.make_root () in
+  let new_fiber = Fiber_context.make_root Mock_scheduler in
   let result = ref None in
   let `Exit_scheduler =
     Domain_local_await.using

@@ -397,3 +397,8 @@ let fork_coroutine ~sw fn =
 
 let fork_seq ~sw fn =
   Seq.of_dispenser (fork_coroutine ~sw fn)
+
+
+type _ Effect.t += Nest : ((unit -> 'a) -> 'a) Effect.t
+
+let nest fn = Effect.perform Nest fn
