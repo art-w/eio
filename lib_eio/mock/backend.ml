@@ -22,7 +22,13 @@ type t = {
   run_q : (unit -> exit) Lf_queue.t;
 
   mono_clock : Clock.Mono.t;
+
+  scheduler_tag : Fiber_context.scheduler_tag;
+
+  stuck : ((unit, exn) result -> unit) option Atomic.t;
 }
+
+type Fiber_context.scheduler_tag += Mock_scheduler of t
 
 module Wall_clock = struct
   type t = Clock.Mono.t
@@ -48,7 +54,27 @@ let rec schedule t : exit =
     if Clock.Mono.try_advance t.mono_clock then schedule t
     else `Exit_scheduler      (* Finished (or deadlocked) *)
 
-type Fiber_context.scheduler_tag += Mock_scheduler
+let rec io_yield t finished () =
+  if Lf_queue.is_empty t.run_q
+  then
+    if finished () then `Exit_scheduler
+    else (
+      Effect.perform (Eio.Private.Effects.Suspend (fun _ctx enqueue ->
+        let stuck = Some enqueue in
+        if not (Atomic.compare_and_set t.stuck None stuck)
+        then invalid_arg "nested scheduler is already stuck";
+        if not (Lf_queue.is_empty t.run_q)
+        && Atomic.compare_and_set t.stuck stuck None
+        then enqueue (Ok ())
+      ));
+      Lf_queue.push t.run_q (io_yield t finished);
+      schedule t
+    )
+  else (
+    Eio.Fiber.yield ();
+    Lf_queue.push t.run_q (io_yield t finished);
+    schedule t
+  )
 
 (* Run [main] in an Eio main loop. *)
 let run_full main =
@@ -60,8 +86,8 @@ let run_full main =
     method debug = Eio.Private.Debug.v
     method backend_id = "mock"
   end in
-  let t = { run_q = Lf_queue.create (); mono_clock } in
-  let rec fork ~new_fiber:fiber fn =
+  let rec t = { run_q = Lf_queue.create (); mono_clock; stuck = Atomic.make None; scheduler_tag = Mock_scheduler t } in
+  let rec fork ~t ~new_fiber:fiber fn =
     Trace.fiber (Fiber_context.tid fiber);
     (* Create a new fiber and run [fn] in it. *)
     Effect.Deep.match_with fn ()
@@ -85,31 +111,61 @@ let run_full main =
                       match result with
                       | Ok v -> Suspended.continue k v
                       | Error ex -> Suspended.discontinue k ex
-                    )
+                    );
+                  if Atomic.get t.stuck <> None
+                  then match Atomic.exchange t.stuck None with
+                    | None -> ()
+                    | Some unstuck -> unstuck (Ok ())
                 );
               (* Switch to the next runnable fiber while this one's blocked. *)
               schedule t
             )
-          | Eio.Private.Effects.Fork (new_fiber, f) -> Some (fun k ->
+          | Eio.Private.Effects.Fork (new_fiber, f) ->
+            if Fiber_context.scheduler_tag new_fiber != t.scheduler_tag
+            then None
+            else Some (fun k ->
               let k = { Suspended.k; fiber } in
               (* Arrange for the forking fiber to run immediately after the new one. *)
               Lf_queue.push_head t.run_q (Suspended.continue k);
               (* Create and run the new fiber (using fiber context [new_fiber]). *)
-              fork ~new_fiber f
+              fork ~t ~new_fiber f
             )
+          | Eio.Private.Effects.Nest ->
+              Some (fun k -> Effect.Deep.continue k (with_nested_sched ~t))
           | Eio.Private.Effects.Get_context -> Some (fun k ->
               Effect.Deep.continue k fiber
             )
           | _ -> None
       }
+  and with_nested_sched : type a. t:t -> (unit -> a) -> a = fun ~t:parent fn ->
+    let rec t =
+      { parent with scheduler_tag = Mock_scheduler t;
+                    stuck = Atomic.make None;
+                    run_q = Lf_queue.create () } in
+    let new_fiber = Fiber_context.make_root t.scheduler_tag in
+    let result = ref None in
+    let finished () = !result <> None in
+    Lf_queue.push t.run_q (io_yield t finished);
+    let `Exit_scheduler =
+      fork ~t ~new_fiber @@ fun () ->
+      match fn () with
+      | x -> result := Some (Ok x)
+      | exception ex ->
+        let bt = Printexc.get_raw_backtrace () in
+        result := Some (Error (ex, bt))
+    in
+    match !result with
+    | None -> assert false
+    | Some (Ok v) -> v
+    | Some (Error (e, bt)) -> Printexc.raise_with_backtrace e bt
   in
-  let new_fiber = Fiber_context.make_root Mock_scheduler in
+  let new_fiber = Fiber_context.make_root t.scheduler_tag in
   let result = ref None in
   let `Exit_scheduler =
     Domain_local_await.using
       ~prepare_for_await:Eio_utils.Dla.prepare_for_await
       ~while_running:(fun () ->
-        fork ~new_fiber (fun () -> result := Some (main stdenv))) in
+        fork ~t ~new_fiber (fun () -> result := Some (main stdenv))) in
   match !result with
   | None -> raise Deadlock_detected
   | Some x -> x

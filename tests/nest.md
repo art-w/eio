@@ -1,5 +1,6 @@
 ```ocaml
 # #require "eio";;
+# #require "eio.mock";;
 # #require "eio_main";;
 ```
 
@@ -31,8 +32,7 @@ This is broken because the forked Uid effects are performed in the wrong scope, 
 ```ocaml
 open Eio
 
-let test () =
-  Eio_main.run @@ fun env ->
+let test env =
   with_uid @@ fun () ->
   Format.printf "first uid = %i@." (uid ());
   Fiber.both
@@ -47,7 +47,7 @@ let test () =
   Format.printf " last uid = %i@." (uid ())
 ```
 ```ocaml
-# test () ;;
+# Eio_main.run test ;;
 first uid = 0
 Exception: Stdlib.Effect.Unhandled(Uid)
 ```
@@ -57,8 +57,7 @@ But this works because the added `Fiber.nest` avoids Eio effects escaping the `w
 ```ocaml
 open Eio
 
-let test () =
-     Eio_main.run @@ fun env ->
+let test env =
      with_uid @@ fun () ->
 (**) Fiber.nest @@ fun () ->
      Format.printf "first uid = %i@." (uid ());
@@ -74,10 +73,18 @@ let test () =
      Format.printf " last uid = %i@." (uid ())
 ```
 ```ocaml
-# test () ;;
+# Eio_main.run test ;;
 first uid = 0
  left uid = 1
 right uid = 2
+ last uid = 3
+- : unit = ()
+# Eio_mock.Backend.run_full test ;;
+first uid = 0
++mock time is now 0.001
+ left uid = 1
+right uid = 2
++mock time is now 0.002
  last uid = 3
 - : unit = ()
 ```
@@ -88,23 +95,158 @@ Note that Eio fibers that are forked with an **outer** switch are executed outsi
 open Eio
 
 let test () =
- Eio_main.run @@ fun env ->
- Switch.run @@ fun outer ->
- with_uid @@ fun () ->
- Fiber.nest @@ fun () ->
- Switch.run @@ fun inner ->
- Fiber.fork ~sw:inner (fun () -> Format.printf "ok: %i@." (uid ()));
- Fiber.fork ~sw:outer (fun () -> Format.printf "not ok: %i@." (uid ()));
- Fiber.fork ~sw:inner (fun () -> Format.printf "ok: %i@." (uid ()))
+  Eio_main.run @@ fun env ->
+  Switch.run @@ fun outer ->
+  with_uid @@ fun () ->
+  Fiber.nest @@ fun () ->
+  let () =
+    Switch.run @@ fun inner ->
+    Fiber.fork ~sw:inner (fun () -> Format.printf "ok: %i@." (uid ()));
+    Fiber.fork ~sw:outer (fun () -> Format.printf "not ok: %i@." (uid ()));
+    Fiber.fork ~sw:inner (fun () -> Format.printf "ok: %i@." (uid ()))
+  in
+  Format.printf "inner terminated@."
 ```
 ```ocaml
 # test () ;;
 ok: 0
 ok: 1
+inner terminated
 Exception: Stdlib.Effect.Unhandled(Uid)
 ```
 
-We can also define a scheduler to control the execution of Eio computations:
+On one end, this makes sense because the `outer` forked fiber could survive past the `with_uid` handler so the unhandled effect could be expected, without special care. But truth is, I just don't know what's needed to make it work or if it's even possible.
+
+On the positive side, this can allow for multiple `with_uid` to run at different levels:
+
+```ocaml
+open Eio
+
+let test env =
+  Switch.run @@ fun outer ->
+  let p, r = Promise.create () in
+  with_uid @@ fun () ->
+  Fiber.nest @@ fun () ->
+  Switch.run @@ fun lvl0 ->
+  with_uid @@ fun () ->
+  Fiber.nest @@ fun () ->
+  let () =
+    Switch.run @@ fun lvl1 ->
+    Fiber.fork ~sw:lvl1 (fun () ->
+      Time.sleep env#clock 0.001;
+      Format.printf " left lvl1: %i@." (uid ());
+      Time.sleep env#clock 0.001;
+      Fiber.fork ~sw:lvl0 (fun () ->
+        Time.sleep env#clock 0.001;
+        Format.printf " left lvl0: %i@." (uid ());
+        Time.sleep env#clock 0.001;
+        Promise.resolve r ();
+        Time.sleep env#clock 0.009;
+        Format.printf " left lvl0: %i@." (uid ());
+      );
+      Time.sleep env#clock 0.001;
+      Format.printf " left lvl1: %i@." (uid ());
+      Time.sleep env#clock 0.001;
+      );
+    Fiber.fork ~sw:lvl0 (fun () ->
+      Format.printf "right lvl0: %i@." (uid ());
+      Time.sleep env#clock 0.001;
+      Format.printf "right lvl0: %i@." (uid ());
+      Time.sleep env#clock 0.001;
+      Promise.await p;
+      Time.sleep env#clock 0.009;
+      Format.printf "right lvl0: %i@." (uid ());
+      );
+    Promise.await p
+  in
+  Format.printf "lvl1 terminated@."
+```
+```ocaml
+# Eio_main.run test ;;
+right lvl0: 0
+ left lvl1: 0
+right lvl0: 1
+ left lvl0: 2
+ left lvl1: 1
+lvl1 terminated
+ left lvl0: 3
+right lvl0: 4
+- : unit = ()
+# Eio_mock.Backend.run_full test ;;
+right lvl0: 0
++mock time is now 0.001
+ left lvl1: 0
+right lvl0: 1
++mock time is now 0.002
++mock time is now 0.003
+ left lvl0: 2
+ left lvl1: 1
++mock time is now 0.004
+lvl1 terminated
++mock time is now 0.013
+ left lvl0: 3
+right lvl0: 4
+- : unit = ()
+```
+
+An unforeseen side-effect of `nest` is that it restricts how fibers can be forked. Eio allows for complex switch forking patterns:
+
+```ocaml
+open Eio
+
+let test env =
+  let p, r = Promise.create () in
+  Switch.run @@ fun outer ->
+  Switch.run @@ fun inner ->
+  let () =
+    Fiber.fork ~sw:outer @@ fun () ->
+      Time.sleep env#clock 0.001;
+      Fiber.fork ~sw:inner (fun () -> Time.sleep env#clock 0.001; Format.printf "this is fine@.");
+      Promise.resolve r ()
+  in
+  Promise.await p (* comment this line to allow [inner] to terminate too soon *)
+```
+```ocaml
+# Eio_main.run test ;;
+this is fine
+- : unit = ()
+# Eio_mock.Backend.run_full test ;;
++mock time is now 0.001
++mock time is now 0.002
+this is fine
+- : unit = ()
+```
+
+Note that this would generally fail if done without care, since the `inner` switch could terminate before all of its forked fibers had a change to be created (resulting in a `"Switch finished!"` exception). If we add a call to `nest`, then this fork pattern results in an unhandled fork effect since the `inner` scope is unreachable from the `outer`:
+
+```ocaml
+open Eio
+
+let test env =
+     let p, r = Promise.create () in
+     Switch.run @@ fun outer ->
+(**) Fiber.nest @@ fun () ->
+     Switch.run @@ fun inner ->
+     let () =
+       Fiber.fork ~sw:outer @@ fun () ->
+         Time.sleep env#clock 0.001;
+         (* it's now forbidden to fork from an [outer] fiber to an [inner] fiber! *)
+         Fiber.fork ~sw:inner (fun () -> Time.sleep env#clock 0.001; Format.printf "this is not fine@.");
+         Promise.resolve r ()
+     in
+     Promise.await p
+```
+```ocaml
+# Eio_main.run test ;;
+Exception: Stdlib.Effect.Unhandled(Eio__core__Fiber.Fork(_, _))
+# Eio_mock.Backend.run_full test ;;
++mock time is now 0.001
+Exception: Eio_mock__Backend.Deadlock_detected.
+```
+
+The error message could be improved, but otherwise I also don't know how to fix this. Help is welcome if you have ideas!
+
+Anyway, with this minor limitations in mind, we can do some fancy stuff and define a scheduler to control the execution of Eio computations:
 
 ```ocaml
 type _ Effect.t += Yield : unit Effect.t
@@ -183,12 +325,12 @@ right uid = 2
 .left read file
 .left resolve promise
  left uid = 3
-..right length = 8_645
+..right length = 12_870
  last uid = 4
 - : unit = ()
 ```
 
-Or if we want to interop with another scheduler like Miou:
+This suggests that we could interop with arbitrary schedulers, for example Miou:
 
 ```ocaml
 # #require "miou" ;;
@@ -222,7 +364,7 @@ ok until here
 Exception: Stdlib.Effect.Unhandled(Miou.Self)
 ```
 
-We can also fix this by adding `Fiber.nest` every time we want to call Eio code, to avoid Eio fiber forks escaping above the Miou handler:
+By adding `Fiber.nest` every time we want to call Eio code, we avoid Eio fiber forks escaping above the Miou handler:
 
 ```ocaml
 open Eio
@@ -248,7 +390,7 @@ let test () =
 ```
 ```ocaml
 # test () ;;
-This file length = 8_645
+This file length = 12_870
 - : unit = ()
 ```
 
