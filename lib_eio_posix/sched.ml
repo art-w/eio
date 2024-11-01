@@ -22,13 +22,12 @@ module Trace = Eio.Private.Trace
 module Rcfd = Eio_unix.Private.Rcfd
 module Poll = Iomux.Poll
 
-type Fiber_context.scheduler_tag += Posix_scheduler
-
 type exit = [`Exit_scheduler]
 
 (* The type of items in the run queue. *)
 type runnable =
   | IO : runnable                                       (* Reminder to check for IO *)
+  | IO_yield : (unit -> bool) -> runnable               (* Reminder to yield for nested schedulers *)
   | Thread : 'a Suspended.t * 'a -> runnable            (* Resume a fiber with a result value *)
   | Failed_thread : 'a Suspended.t * exn -> runnable    (* Resume a fiber with an exception *)
 
@@ -63,7 +62,16 @@ type t = {
   sleep_q: Zzz.t;                       (* Fibers waiting for timers. *)
 
   thread_pool : Eio_unix.Private.Thread_pool.t;
+
+  scheduler_tag : Fiber_context.scheduler_tag;
 }
+
+type Fiber_context.scheduler_tag += Posix_scheduler of t
+
+let t_of_suspended (k : _ Suspended.t) =
+  match Fiber_context.scheduler_tag k.fiber with
+  | Posix_scheduler t -> t
+  | _ -> invalid_arg "expected posix scheduler tag!"
 
 (* The message to send to [eventfd] (any character would do). *)
 let wake_buffer = Bytes.of_string "!"
@@ -184,6 +192,15 @@ let rec next t : [`Exit_scheduler] =
   | Some Failed_thread (k, ex) ->
     Fiber_context.clear_cancel_fn k.fiber;
     Suspended.discontinue k ex
+  | Some (IO_yield finished as io_yield) ->
+    if Lf_queue.is_empty t.run_q && finished ()
+    then `Exit_scheduler
+    else (
+      (* TODO: if run_q is empty, suspend this scheduler until new stuff is pushed *)
+      Eio.Fiber.yield ();
+      Lf_queue.push t.run_q io_yield;
+      next t
+    )
   | Some IO -> (* Note: be sure to re-inject the IO task before continuing! *)
     (* This is not a fair scheduler: timers always run before all other IO *)
     let now = Mtime_clock.now () in
@@ -192,7 +209,7 @@ let rec next t : [`Exit_scheduler] =
       (* A sleeping task is now due *)
       Lf_queue.push t.run_q IO;                 (* Re-inject IO job in the run queue *)
       begin match k with
-        | Fiber k -> Suspended.continue k ()
+        | Fiber k -> continue ~t k ()
         | Fn fn -> fn (); next t
       end
     | `Wait_until _ | `Nothing as next_due ->
@@ -235,6 +252,16 @@ let rec next t : [`Exit_scheduler] =
         next t
       )
 
+and continue : type a. t:t -> a Suspended.t -> a -> [`Exit_scheduler]
+= fun ~t k v ->
+  let tk = t_of_suspended k in
+  if t == tk
+  then Suspended.continue k v
+  else (
+    Lf_queue.push tk.run_q (Thread (k, v));
+    next t
+  )
+
 let with_sched fn =
   let run_q = Lf_queue.create () in
   Lf_queue.push run_q IO;
@@ -251,8 +278,10 @@ let with_sched fn =
   let poll = Poll.create () in
   let fd_map = Hashtbl.create 10 in
   let thread_pool = Eio_unix.Private.Thread_pool.create ~sleep_q in
-  let t = { run_q; poll; poll_maxi = (-1); fd_map; eventfd; eventfd_r;
-            active_ops = 0; need_wakeup = Atomic.make false; sleep_q; thread_pool } in
+  let rec t =
+    { run_q; poll; poll_maxi = (-1); fd_map; eventfd; eventfd_r;
+      active_ops = 0; need_wakeup = Atomic.make false; sleep_q;
+      thread_pool; scheduler_tag = Posix_scheduler t } in
   let eventfd_ri = Iomux.Util.fd_of_unix eventfd_r in
   Poll.set_index t.poll eventfd_ri eventfd_r Poll.Flags.pollin;
   if eventfd_ri > t.poll_maxi then
@@ -334,7 +363,7 @@ let enter op fn =
   Effect.perform (Enter fn)
 
 let run ~extra_effects t main x =
-  let rec fork ~new_fiber:fiber fn =
+  let rec fork ~t ~new_fiber:fiber fn =
     let open Effect.Deep in
     Trace.fiber (Fiber_context.tid fiber);
     match_with fn ()
@@ -357,11 +386,16 @@ let run ~extra_effects t main x =
               f fiber enqueue;
               next t
             )
-          | Eio.Private.Effects.Fork (new_fiber, f) -> Some (fun k ->
+          | Eio.Private.Effects.Fork (new_fiber, f) ->
+            if Fiber_context.scheduler_tag new_fiber != t.scheduler_tag
+            then None
+            else Some (fun k ->
               let k = { Suspended.k; fiber } in
               enqueue_at_head t k;
-              fork ~new_fiber f
+              fork ~t ~new_fiber f
             )
+          | Eio.Private.Effects.Nest ->
+              Some (fun k -> Effect.Deep.continue k (with_nested_sched ~t))
           | Eio_unix.Private.Await_readable fd -> Some (fun k ->
               await_readable t { Suspended.k; fiber } fd
             )
@@ -376,14 +410,33 @@ let run ~extra_effects t main x =
             )
           | e -> extra_effects.Effect.Deep.effc e
       }
+  and with_nested_sched : type a. t:t -> (unit -> a) -> a =
+    fun ~t:parent fn ->
+    let rec t = { parent with scheduler_tag = Posix_scheduler t; run_q = Lf_queue.create () } in
+    let new_fiber = Fiber_context.make_root t.scheduler_tag in
+    let result = ref None in
+    let finished () = !result <> None in
+    Lf_queue.push t.run_q (IO_yield finished);
+    let `Exit_scheduler =
+      fork ~t ~new_fiber @@ fun () ->
+      match fn () with
+      | x -> result := Some (Ok x)
+      | exception ex ->
+        let bt = Printexc.get_raw_backtrace () in
+        result := Some (Error (ex, bt))
+    in
+    match !result with
+    | None -> assert false
+    | Some (Ok v) -> v
+    | Some (Error (e, bt)) -> Printexc.raise_with_backtrace e bt
   in
   let result = ref None in
   let `Exit_scheduler =
-    let new_fiber = Fiber_context.make_root Posix_scheduler in
+    let new_fiber = Fiber_context.make_root t.scheduler_tag in
     Domain_local_await.using
       ~prepare_for_await:Eio_utils.Dla.prepare_for_await
       ~while_running:(fun () ->
-          fork ~new_fiber (fun () ->
+          fork ~t ~new_fiber (fun () ->
               Eio_unix.Private.Thread_pool.run t.thread_pool @@ fun () ->
               result := Some (with_op t main x);
             )
