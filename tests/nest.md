@@ -36,8 +36,14 @@ let test () =
   with_uid @@ fun () ->
   Format.printf "first uid = %i@." (uid ());
   Fiber.both
-    (fun () -> Format.printf " left uid = %i@." (uid ()))
-    (fun () -> Format.printf "right uid = %i@." (uid ()));
+    (fun () ->
+      Time.sleep env#clock 0.001;
+      Format.printf " left uid = %i@." (uid ());
+      Time.sleep env#clock 0.001)
+    (fun () ->
+      Time.sleep env#clock 0.001;
+      Format.printf "right uid = %i@." (uid ());
+      Time.sleep env#clock 0.001);
   Format.printf " last uid = %i@." (uid ())
 ```
 ```ocaml
@@ -57,8 +63,14 @@ let test () =
 (**) Fiber.nest @@ fun () ->
      Format.printf "first uid = %i@." (uid ());
      Fiber.both
-       (fun () -> Format.printf " left uid = %i@." (uid ()))
-       (fun () -> Format.printf "right uid = %i@." (uid ()));
+       (fun () ->
+         Time.sleep env#clock 0.001;
+         Format.printf " left uid = %i@." (uid ());
+         Time.sleep env#clock 0.001)
+       (fun () ->
+         Time.sleep env#clock 0.001;
+         Format.printf "right uid = %i@." (uid ());
+         Time.sleep env#clock 0.001);
      Format.printf " last uid = %i@." (uid ())
 ```
 ```ocaml
@@ -171,7 +183,7 @@ right uid = 2
 .left read file
 .left resolve promise
  left uid = 3
-..right length = 8_331
+..right length = 8_645
  last uid = 4
 - : unit = ()
 ```
@@ -236,7 +248,7 @@ let test () =
 ```
 ```ocaml
 # test () ;;
-This file length = 8_331
+This file length = 8_645
 - : unit = ()
 ```
 

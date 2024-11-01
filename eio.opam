@@ -23,6 +23,7 @@ depends: [
   "mtime" {>= "2.0.0"}
   "mdx" {>= "2.4.1" & with-test}
   "dscheck" {>= "0.1.0" & with-test}
+  "miou" {>= "0.3.0" & with-test}
   "odoc" {with-doc}
 ]
 conflicts: [

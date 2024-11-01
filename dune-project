@@ -25,7 +25,8 @@
   (crowbar (and (>= 0.2) :with-test))
   (mtime (>= 2.0.0))
   (mdx (and (>= 2.4.1) :with-test))
-  (dscheck (and (>= 0.1.0) :with-test))))
+  (dscheck (and (>= 0.1.0) :with-test))
+  (miou (and (>= 0.3.0) :with-test))))
 (package
  (name eio_linux)
  (synopsis "Eio implementation for Linux using io-uring")
